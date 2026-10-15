@@ -1302,6 +1302,10 @@ func prove(f *ssa.Func) {
 		}
 	}
 
+	// Save eligibility using facts at the first guard, then rewrite after
+	// the dominator walk so new blocks cannot invalidate that traversal.
+	var boundsCandidates []boundsCandidate
+
 	// current node state
 	type walkState int
 	const (
@@ -1387,6 +1391,12 @@ func prove(f *ssa.Func) {
 			}
 
 			ft.simplifyBlock(sdom, node.block)
+			if b := node.block; boundsGuard(b) {
+				guard := b.Controls[0]
+				if lim := ft.limits[guard.Args[0].ID]; lim.Min >= 0 {
+					boundsCandidates = append(boundsCandidates, boundsCandidate{b, guard, lim.Umax})
+				}
+			}
 
 			work = append(work, bp{
 				block: node.block,
@@ -1407,6 +1417,7 @@ func prove(f *ssa.Func) {
 	ft.restore()
 
 	ft.cleanup(f)
+	fuseBounds(f, boundsCandidates)
 }
 
 // flowLimit updates the known limits of v in ft.
