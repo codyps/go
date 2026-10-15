@@ -566,20 +566,9 @@ opSwitch:
 						// runtime.heapBits.nextArena.
 						cheap = true
 					}
-					// Special case: on architectures that can do unaligned loads,
-					// explicitly mark encoding/binary methods as cheap,
-					// because in practice they are, even though our inlining
-					// budgeting system does not see that. See issue 42958.
-					if base.Ctxt.Arch.CanMergeLoads && s.Pkg.Path == "encoding/binary" {
-						switch s.Name {
-						case "littleEndian.Uint64", "littleEndian.Uint32", "littleEndian.Uint16",
-							"bigEndian.Uint64", "bigEndian.Uint32", "bigEndian.Uint16",
-							"littleEndian.PutUint64", "littleEndian.PutUint32", "littleEndian.PutUint16",
-							"bigEndian.PutUint64", "bigEndian.PutUint32", "bigEndian.PutUint16",
-							"littleEndian.AppendUint64", "littleEndian.AppendUint32", "littleEndian.AppendUint16",
-							"bigEndian.AppendUint64", "bigEndian.AppendUint32", "bigEndian.AppendUint16":
-							cheap = true
-						}
+					// Endian operations are cheap after load/store combining.
+					if cheapEndianFunc(s) {
+						cheap = true
 					}
 				}
 			}
@@ -592,20 +581,8 @@ opSwitch:
 		if n.Fun.Op() == ir.ONAME {
 			name := n.Fun.(*ir.Name)
 			if name.Class == ir.PFUNC {
-				// Special case: on architectures that can do unaligned loads,
-				// explicitly mark internal/byteorder methods as cheap,
-				// because in practice they are, even though our inlining
-				// budgeting system does not see that. See issue 42958.
-				if base.Ctxt.Arch.CanMergeLoads && name.Sym().Pkg.Path == "internal/byteorder" {
-					switch name.Sym().Name {
-					case "LEUint64", "LEUint32", "LEUint16",
-						"BEUint64", "BEUint32", "BEUint16",
-						"LEPutUint64", "LEPutUint32", "LEPutUint16",
-						"BEPutUint64", "BEPutUint32", "BEPutUint16",
-						"LEAppendUint64", "LEAppendUint32", "LEAppendUint16",
-						"BEAppendUint64", "BEAppendUint32", "BEAppendUint16":
-						cheap = true
-					}
+				if cheapEndianFunc(name.Sym()) {
+					cheap = true
 				}
 			}
 			if name.Class == ir.PPARAM || name.Class == ir.PAUTOHEAP && name.IsClosureVar() {
@@ -975,6 +952,35 @@ var InlineCall = func(callerfn *ir.Func, call *ir.CallExpr, fn *ir.Func, inlInde
 	panic("unreachable")
 }
 
+// cheapEndianFunc matches operations whose byte expressions combine into a
+// small load/store sequence. Apply the same credit when costing wrappers and
+// when deciding whether to inline into a large caller. See issue 42958.
+func cheapEndianFunc(s *types.Sym) bool {
+	if !base.Ctxt.Arch.CanMergeLoads {
+		return false
+	}
+	switch s.Pkg.Path {
+	case "encoding/binary":
+		switch s.Name {
+		case "littleEndian.Uint64", "littleEndian.Uint32", "littleEndian.Uint16",
+			"bigEndian.Uint64", "bigEndian.Uint32", "bigEndian.Uint16",
+			"littleEndian.PutUint64", "littleEndian.PutUint32", "littleEndian.PutUint16",
+			"bigEndian.PutUint64", "bigEndian.PutUint32", "bigEndian.PutUint16",
+			"littleEndian.AppendUint64", "littleEndian.AppendUint32", "littleEndian.AppendUint16",
+			"bigEndian.AppendUint64", "bigEndian.AppendUint32", "bigEndian.AppendUint16":
+			return true
+		}
+	case "internal/byteorder":
+		switch s.Name {
+		case "LEUint64", "LEUint32", "LEUint16", "BEUint64", "BEUint32", "BEUint16",
+			"LEPutUint64", "LEPutUint32", "LEPutUint16", "BEPutUint64", "BEPutUint32", "BEPutUint16",
+			"LEAppendUint64", "LEAppendUint32", "LEAppendUint16", "BEAppendUint64", "BEAppendUint32", "BEAppendUint16":
+			return true
+		}
+	}
+	return false
+}
+
 // inlineCostOK returns true if call n from caller to callee is cheap enough to
 // inline. bigCaller indicates that caller is a big function.
 //
@@ -991,7 +997,7 @@ func inlineCostOK(n *ir.CallExpr, caller, callee *ir.Func, bigCaller, closureCal
 		maxCost = inlineHotMaxBudget
 	}
 
-	if bigCaller {
+	if bigCaller && !cheapEndianFunc(callee.Sym()) {
 		// We use this to restrict inlining into very big functions.
 		// See issue 26546 and 17566.
 		maxCost = inlineBigFunctionMaxCost
