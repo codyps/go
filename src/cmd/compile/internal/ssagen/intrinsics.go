@@ -135,6 +135,27 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
 		intrinsics.alias(pkg, fn, pkg2, fn2, archs...)
 	}
 
+	// Keep endian accesses compact until SSA construction instead of inlining
+	// their byte expressions. Start with targets supporting unaligned accesses.
+	if !cfg.instrumenting {
+		for _, big := range []bool{false, true} {
+			method, prefix := "littleEndian.", "LE"
+			if big {
+				method, prefix = "bigEndian.", "BE"
+			}
+			for _, width := range []int64{2, 4, 8} {
+				for _, store := range []bool{false, true} {
+					name := fmt.Sprintf("Uint%d", width*8)
+					if store {
+						name = "Put" + name
+					}
+					addF("encoding/binary", method+name, endianIntrinsic(width, big, store, true), sys.AMD64, sys.I386, sys.ARM64)
+					addF("internal/byteorder", prefix+name, endianIntrinsic(width, big, store, false), sys.AMD64, sys.I386, sys.ARM64)
+				}
+			}
+		}
+	}
+
 	/******** runtime ********/
 	if !cfg.instrumenting {
 		add("runtime", "slicebytetostringtmp",
@@ -2596,11 +2617,50 @@ func sveStorePart(elemBytes int64) intrinsicBuilder {
 
 // findIntrinsic returns a function which builds the SSA equivalent of the
 // function identified by the symbol sym.  If sym is not an intrinsic call, returns nil.
+// endianIntrinsic emits the same early bounds check as the Go implementation,
+// followed by an unaligned word access. Argument evaluation has already happened.
+func endianIntrinsic(width int64, big, store, method bool) intrinsicBuilder {
+	return func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
+		if method {
+			args = args[1:] // empty endian receiver
+		}
+		b := args[0]
+		length := s.newValue1(ssaop.OpSliceLen, types.Types[types.TINT], b)
+		s.boundsCheck(s.constInt(types.Types[types.TINT], width-1), length, ssa.BoundsIndex, false)
+		typ, swap := types.Types[types.TUINT16], ssaop.OpBswap16
+		switch width {
+		case 4:
+			typ, swap = types.Types[types.TUINT32], ssaop.OpBswap32
+		case 8:
+			typ, swap = types.Types[types.TUINT64], ssaop.OpBswap64
+		}
+		ptr := s.newValue1(ssaop.OpSlicePtr, types.NewPtr(types.Types[types.TUINT8]), b)
+		var val *ssa.Value
+		if store {
+			val = args[1]
+		} else {
+			val = s.load(typ, ptr)
+		}
+		if big != s.f.Config.BigEndian {
+			val = s.newValue1(swap, typ, val)
+		}
+		if store {
+			s.store(typ, ptr, val)
+			return nil
+		}
+		return val
+	}
+}
+
 func findIntrinsic(sym *types.Sym) intrinsicBuilder {
 	if sym == nil || sym.Pkg == nil {
 		return nil
 	}
 	pkg := sym.Pkg.Path
+	// Preserve the existing byte-access instrumentation and Spectre masking.
+	if base.Flag.Cfg.SpectreIndex && (pkg == "encoding/binary" || pkg == "internal/byteorder") {
+		return nil
+	}
 	if sym.Pkg == ir.Pkgs.Runtime {
 		pkg = "runtime"
 	}
